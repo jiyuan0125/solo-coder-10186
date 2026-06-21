@@ -1,11 +1,14 @@
 import fs from 'node:fs/promises';
 import type { ViteDevServer } from 'vite';
 import {
+  addTagsToMetaInSource,
   duplicatePageInDefaultExportInSource,
   duplicateSlideDir,
   removePageFromDefaultExportInSource,
+  removeTagsFromMetaInSource,
   reorderDefaultExportPagesInSource,
   reorderNotesArrayInSource,
+  replaceMetaTagsInSource,
   resolveSlideEntry,
   rmSlideDir,
   SLIDE_ID_RE,
@@ -20,11 +23,15 @@ import { type ApiContext, json, readBody } from './context.ts';
 // DELETE /__slides/:id/pages/:i           remove page
 // POST   /__slides/:id/pages/:i/duplicate duplicate page
 // POST   /__slides/:id/duplicate          duplicate slide directory { newId? }
+// PUT    /__slides/:id/tags               replace tags { tags: string[] }
+// POST   /__slides/:id/tags               add tags { tags: string[] }
+// DELETE /__slides/:id/tags               remove tags { tags: string[] }
 // PATCH  /__slides/:id                    rename slide (writes meta.title)
 // DELETE /__slides/:id                    delete slide directory + folder assignment
 
 type DuplicateSlideBody = { newId?: unknown };
 type SlidePatchBody = { name?: unknown };
+type TagsBody = { tags?: unknown };
 
 export function registerSlideRoutes(server: ViteDevServer, ctx: ApiContext): void {
   server.middlewares.use('/__slides', async (req, res, next) => {
@@ -144,6 +151,60 @@ export function registerSlideRoutes(server: ViteDevServer, ctx: ApiContext): voi
           await writeManifest(ctx.manifestPath, manifest);
         }
         return json(res, 200, { ok: true, slideId: duplicated.slideId });
+      }
+
+      const tagsMatch = url.pathname.match(/^\/([^/]+)\/tags$/);
+      if (tagsMatch) {
+        const slideId = tagsMatch[1];
+        if (!SLIDE_ID_RE.test(slideId)) return json(res, 400, { error: 'invalid slideId' });
+        const requestCheck = validateMutationRequest(req, { requireJsonBody: true });
+        if (!requestCheck.ok) {
+          return json(res, requestCheck.status, { error: requestCheck.error });
+        }
+
+        const body = (await readBody(req)) as TagsBody;
+        if (!Array.isArray(body.tags)) {
+          return json(res, 400, { error: 'invalid tags — expected string array' });
+        }
+        const tags: string[] = [];
+        for (const t of body.tags) {
+          if (typeof t !== 'string') {
+            return json(res, 400, { error: 'invalid tags — expected string array' });
+          }
+          tags.push(t);
+        }
+
+        const entry = resolveSlideEntry(ctx.slidesRoot, slideId);
+        if (!entry) return json(res, 400, { error: 'invalid slideId' });
+
+        let source: string;
+        try {
+          source = await fs.readFile(entry, 'utf8');
+        } catch {
+          return json(res, 404, { error: 'slide not found' });
+        }
+
+        let updated: string | null = null;
+        if (method === 'PUT') {
+          updated = replaceMetaTagsInSource(source, tags);
+        } else if (method === 'POST') {
+          updated = addTagsToMetaInSource(source, tags);
+        } else if (method === 'DELETE') {
+          updated = removeTagsFromMetaInSource(source, tags);
+        } else {
+          return next();
+        }
+
+        if (updated === null) {
+          return json(res, 422, {
+            error: 'could not update tags in index.tsx',
+          });
+        }
+        if (updated !== source) {
+          await fs.writeFile(entry, updated, 'utf8');
+        }
+        server.ws.send({ type: 'full-reload' });
+        return json(res, 200, { ok: true, slideId, tags });
       }
 
       const idMatch = url.pathname.match(/^\/([^/]+)$/);

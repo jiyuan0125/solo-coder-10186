@@ -9,6 +9,8 @@ export type SlideMeta = {
   theme?: string;
   /** ISO 8601 timestamp. Set once at scaffold time; used to sort the slide list. */
   createdAt?: string;
+  /** Tags for categorizing and filtering slides. */
+  tags?: string[];
 };
 
 export type SlideModule = {

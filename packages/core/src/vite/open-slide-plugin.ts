@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { parse as babelParse } from '@babel/parser';
+import * as t from '@babel/types';
 import fg from 'fast-glob';
 import { loadConfigFromFile, normalizePath, type Plugin, type ViteDevServer } from 'vite';
 import type { OpenSlideConfig } from '../config.ts';
@@ -63,40 +65,91 @@ function toId(absFile: string, slidesRoot: string): string {
   return rel.split(path.sep)[0];
 }
 
-const META_THEME_RE = /(?:^|[\s,{])theme\s*:\s*['"]([^'"]+)['"]/;
-const META_CREATED_AT_RE = /(?:^|[\s,{])createdAt\s*:\s*['"]([^'"]+)['"]/;
+type ExtractedMeta = { theme: string | null; createdAt: string | null; tags: string[] | null };
 
-type ExtractedMeta = { theme: string | null; createdAt: string | null };
+function unwrapMetaExpression(node: t.Expression | undefined): t.Expression | undefined {
+  let current = node;
+  while (current && (t.isTSAsExpression(current) || t.isTSSatisfiesExpression(current))) {
+    current = current.expression as t.Expression;
+  }
+  return current;
+}
+
+function readStringLiteralValue(valueNode: t.Expression): string | null {
+  if (t.isStringLiteral(valueNode)) return valueNode.value;
+  if (t.isTemplateLiteral(valueNode) && valueNode.expressions.length === 0) {
+    const first = valueNode.quasis[0];
+    return first.value.cooked ?? first.value.raw ?? null;
+  }
+  return null;
+}
+
+function readStringArrayValue(valueNode: t.Expression): string[] | null {
+  if (!t.isArrayExpression(valueNode)) return null;
+  const result: string[] = [];
+  for (const el of valueNode.elements) {
+    if (el === null) return null;
+    if (t.isSpreadElement(el)) return null;
+    const s = readStringLiteralValue(el as t.Expression);
+    if (s === null) return null;
+    result.push(s);
+  }
+  return result;
+}
 
 function extractMeta(src: string): ExtractedMeta {
-  const empty: ExtractedMeta = { theme: null, createdAt: null };
-  const metaStart = src.search(/export\s+const\s+meta\b/);
-  if (metaStart === -1) return empty;
-  const eqIdx = src.indexOf('=', metaStart);
-  if (eqIdx === -1) return empty;
-  const openBrace = src.indexOf('{', eqIdx);
-  if (openBrace === -1) return empty;
-  let depth = 0;
-  let closeBrace = -1;
-  for (let i = openBrace; i < src.length; i++) {
-    const ch = src[i];
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        closeBrace = i;
-        break;
+  const empty: ExtractedMeta = { theme: null, createdAt: null, tags: null };
+  let ast: t.File | null = null;
+  try {
+    ast = babelParse(src, {
+      sourceType: 'module',
+      plugins: ['typescript', 'jsx'],
+      errorRecovery: true,
+    }) as t.File;
+  } catch {
+    return empty;
+  }
+
+  const body = ast.program.body;
+  for (const stmt of body) {
+    if (!t.isExportNamedDeclaration(stmt)) continue;
+    const decl = stmt.declaration;
+    if (!decl || !t.isVariableDeclaration(decl)) continue;
+    for (const d of decl.declarations) {
+      if (!t.isIdentifier(d.id) || d.id.name !== 'meta') continue;
+      const init = unwrapMetaExpression(d.init as t.Expression | undefined);
+      if (!init || !t.isObjectExpression(init)) return empty;
+
+      let theme: string | null = null;
+      let createdAt: string | null = null;
+      let tags: string[] | null = null;
+
+      for (const prop of init.properties) {
+        if (!t.isObjectProperty(prop) || prop.computed) continue;
+        const key = prop.key;
+        let keyName: string | undefined;
+        if (t.isIdentifier(key)) {
+          keyName = key.name;
+        } else if (t.isStringLiteral(key)) {
+          keyName = key.value;
+        }
+        if (!keyName) continue;
+
+        const value = prop.value as t.Expression;
+        if (keyName === 'theme') {
+          theme = readStringLiteralValue(value);
+        } else if (keyName === 'createdAt') {
+          createdAt = readStringLiteralValue(value);
+        } else if (keyName === 'tags') {
+          tags = readStringArrayValue(value);
+        }
       }
+
+      return { theme, createdAt, tags };
     }
   }
-  if (closeBrace === -1) return empty;
-  const body = src.slice(openBrace + 1, closeBrace);
-  const themeMatch = body.match(META_THEME_RE);
-  const createdAtMatch = body.match(META_CREATED_AT_RE);
-  return {
-    theme: themeMatch ? themeMatch[1] : null,
-    createdAt: createdAtMatch ? createdAtMatch[1] : null,
-  };
+
+  return empty;
 }
 
 async function readSlideMeta(abs: string): Promise<ExtractedMeta> {
@@ -104,7 +157,7 @@ async function readSlideMeta(abs: string): Promise<ExtractedMeta> {
     const src = await fs.readFile(abs, 'utf8');
     return extractMeta(src);
   } catch {
-    return { theme: null, createdAt: null };
+    return { theme: null, createdAt: null, tags: null };
   }
 }
 
@@ -124,19 +177,28 @@ async function generateSlidesModule(
       const id = toId(abs, slidesRoot);
       const importPath = isDev ? `@fs/${normalizePath(abs).replace(/^\/+/, '')}` : abs;
       const meta = await readSlideMeta(abs);
-      return { id, importPath, theme: meta.theme, createdAt: parseCreatedAtMs(meta.createdAt) };
+      return {
+        id,
+        importPath,
+        theme: meta.theme,
+        createdAt: parseCreatedAtMs(meta.createdAt),
+        tags: meta.tags,
+      };
     }),
   );
 
   const ids = JSON.stringify(entries.map((e) => e.id).sort());
   const themesMap: Record<string, string> = {};
   const createdAtMap: Record<string, number> = {};
+  const tagsMap: Record<string, string[]> = {};
   for (const e of entries) {
     if (e.theme) themesMap[e.id] = e.theme;
     if (e.createdAt !== null) createdAtMap[e.id] = e.createdAt;
+    if (e.tags) tagsMap[e.id] = e.tags;
   }
   const themesJson = JSON.stringify(themesMap);
   const createdAtJson = JSON.stringify(createdAtMap);
+  const tagsJson = JSON.stringify(tagsMap);
   const importTokens = JSON.stringify(Object.fromEntries(entries.map((e) => [e.id, 0])));
   const devRuntime = isDev
     ? `
@@ -165,6 +227,7 @@ if (import.meta.hot) {
 export const slideIds = ${ids};
 export const slideThemes = ${themesJson};
 export const slideCreatedAt = ${createdAtJson};
+export const slideTags = ${tagsJson};
 ${devRuntime}
 
 export async function loadSlide(id) {

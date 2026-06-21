@@ -3,11 +3,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  addTagsToMetaInSource,
   duplicatePageInDefaultExportInSource,
   duplicateSlideDir,
   removePageFromDefaultExportInSource,
+  removeTagsFromMetaInSource,
   reorderDefaultExportPagesInSource,
   reorderNotesArrayInSource,
+  replaceMetaTagsInSource,
   updateMetaTitleInSource,
   validateSlideName,
 } from './slide-ops.ts';
@@ -26,6 +29,22 @@ async function writeSlide(root: string, id: string, title = id): Promise<void> {
   await fs.writeFile(
     path.join(root, id, 'index.tsx'),
     `export const meta = { title: '${title}' };\nexport default [];\n`,
+    'utf8',
+  );
+  await fs.writeFile(path.join(root, id, 'assets', 'hero.txt'), 'hero', 'utf8');
+}
+
+async function writeSlideWithTags(
+  root: string,
+  id: string,
+  title: string,
+  tags: string[],
+): Promise<void> {
+  await fs.mkdir(path.join(root, id, 'assets'), { recursive: true });
+  const tagsSrc = `['${tags.join("', '")}']`;
+  await fs.writeFile(
+    path.join(root, id, 'index.tsx'),
+    `export const meta = { title: '${title}', tags: ${tagsSrc} };\nexport default [];\n`,
     'utf8',
   );
   await fs.writeFile(path.join(root, id, 'assets', 'hero.txt'), 'hero', 'utf8');
@@ -89,6 +108,23 @@ describe('duplicateSlideDir', () => {
       expect(await duplicateSlideDir(root, 'missing')).toMatchObject({ ok: false, status: 404 });
     });
   });
+
+  it('preserves tags on the copied slide', async () => {
+    await withSlidesRoot(async (root) => {
+      await writeSlideWithTags(root, 'intro', 'Introduction', ['overview', 'beginner']);
+
+      const result = await duplicateSlideDir(root, 'intro');
+
+      expect(result).toEqual({ ok: true, slideId: 'intro-copy' });
+      const copied = await fs.readFile(
+        path.join(root, 'intro-copy', 'index.tsx'),
+        'utf8',
+      );
+      expect(copied).toContain("title: 'Introduction (copy)'");
+      expect(copied).toContain("'overview'");
+      expect(copied).toContain("'beginner'");
+    });
+  });
 });
 
 describe('validateSlideName', () => {
@@ -145,6 +181,194 @@ describe('updateMetaTitleInSource', () => {
 
   it('returns null if there is no meta and no default export', () => {
     expect(updateMetaTitleInSource('// nothing here', 'x')).toBeNull();
+  });
+});
+
+describe('replaceMetaTagsInSource', () => {
+  it('replaces an existing tags array', () => {
+    const source = `export const meta = { tags: ['old'] };\nexport default [];\n`;
+    const out = replaceMetaTagsInSource(source, ['new', 'shiny']);
+    expect(out).toContain("tags: ['new', 'shiny']");
+    expect(out).not.toContain("'old'");
+  });
+
+  it('injects tags into a meta object that lacks them', () => {
+    const source = `export const meta = {\n  title: 'x',\n};\nexport default [];\n`;
+    const out = replaceMetaTagsInSource(source, ['intro']);
+    expect(out).toMatch(/tags:\s*\['intro'\]/);
+    expect(out).toContain("title: 'x'");
+  });
+
+  it('injects a fresh meta export when none exists', () => {
+    const source = `export default [];\n`;
+    const out = replaceMetaTagsInSource(source, ['a', 'b']);
+    expect(out).toContain('export const meta: SlideMeta = { tags: ');
+    expect(out).toContain("['a', 'b']");
+    expect(out).toContain('export default []');
+  });
+
+  it('returns null if there is no meta and no default export', () => {
+    expect(replaceMetaTagsInSource('// nothing', ['x'])).toBeNull();
+  });
+
+  it('handles empty tag list', () => {
+    const source = `export const meta = { tags: ['a', 'b'] };\nexport default [];\n`;
+    const out = replaceMetaTagsInSource(source, []);
+    expect(out).toContain('tags: []');
+    expect(out).not.toContain("'a'");
+    expect(out).not.toContain("'b'");
+  });
+
+  it('escapes special characters in tag values', () => {
+    const source = `export const meta = { tags: ['old'] };\nexport default [];\n`;
+    const out = replaceMetaTagsInSource(source, ["it's", 'a\\b', "qu'ote"]);
+    expect(out).toContain("'it\\'s'");
+    expect(out).toContain("'a\\\\b'");
+    expect(out).toContain("'qu\\'ote'");
+  });
+
+  it('works with braces inside string values in meta', () => {
+    const source = `export const meta = { title: '{ tricky }', tags: ['old'] };\nexport default [];\n`;
+    const out = replaceMetaTagsInSource(source, ['new']);
+    expect(out).toContain("tags: ['new']");
+    expect(out).toContain("title: '{ tricky }'");
+  });
+
+  it('works with template literals in meta', () => {
+    const source = 'export const meta = { title: `{ templated }`, tags: ["old"] };\nexport default [];\n';
+    const out = replaceMetaTagsInSource(source, ['new']);
+    expect(out).toContain("tags: ['new']");
+    expect(out).toContain('`{ templated }`');
+  });
+
+  it('works with comments containing braces', () => {
+    const source = `export const meta = {
+  // comment with { braces }
+  title: 'x',
+  tags: ['old'],
+};\nexport default [];\n`;
+    const out = replaceMetaTagsInSource(source, ['new']);
+    expect(out).toContain("tags: ['new']");
+    expect(out).toContain('// comment with { braces }');
+  });
+});
+
+describe('addTagsToMetaInSource', () => {
+  it('adds tags to an existing tags array', () => {
+    const source = `export const meta = { tags: ['a'] };\nexport default [];\n`;
+    const out = addTagsToMetaInSource(source, ['b', 'c']);
+    expect(out).toContain("'a'");
+    expect(out).toContain("'b'");
+    expect(out).toContain("'c'");
+  });
+
+  it('skips duplicate tags', () => {
+    const source = `export const meta = { tags: ['a', 'b'] };\nexport default [];\n`;
+    const out = addTagsToMetaInSource(source, ['b', 'c']);
+    const match = out?.match(/tags:\s*\[(.*?)\]/);
+    expect(match).not.toBeNull();
+    const tagList = match![1];
+    expect((tagList.match(/'b'/g) || []).length).toBe(1);
+    expect(tagList).toContain("'c'");
+  });
+
+  it('creates tags array when none exists', () => {
+    const source = `export const meta = { title: 'x' };\nexport default [];\n`;
+    const out = addTagsToMetaInSource(source, ['new']);
+    expect(out).toMatch(/tags:\s*\['new'\]/);
+  });
+
+  it('creates meta export when none exists', () => {
+    const source = `export default [];\n`;
+    const out = addTagsToMetaInSource(source, ['first']);
+    expect(out).toContain('tags: ');
+    expect(out).toContain("'first'");
+  });
+
+  it('returns null on unsupported meta shape', () => {
+    const source = `export const meta = () => {};\nexport default [];\n`;
+    expect(addTagsToMetaInSource(source, ['x'])).toBeNull();
+  });
+
+  it('works with braces in string values', () => {
+    const source = `export const meta = { title: '{ tricky }', tags: ['a'] };\nexport default [];\n`;
+    const out = addTagsToMetaInSource(source, ['b']);
+    expect(out).toContain("'a'");
+    expect(out).toContain("'b'");
+    expect(out).toContain("title: '{ tricky }'");
+  });
+});
+
+describe('removeTagsFromMetaInSource', () => {
+  it('removes specified tags from an existing array', () => {
+    const source = `export const meta = { tags: ['a', 'b', 'c'] };\nexport default [];\n`;
+    const out = removeTagsFromMetaInSource(source, ['b']);
+    expect(out).toContain("'a'");
+    expect(out).not.toContain("'b'");
+    expect(out).toContain("'c'");
+  });
+
+  it('silently skips tags that are not present', () => {
+    const source = `export const meta = { tags: ['a'] };\nexport default [];\n`;
+    const out = removeTagsFromMetaInSource(source, ['not-there']);
+    expect(out).toBe(source);
+  });
+
+  it('returns source unchanged when tags property is missing', () => {
+    const source = `export const meta = { title: 'x' };\nexport default [];\n`;
+    expect(removeTagsFromMetaInSource(source, ['a'])).toBe(source);
+  });
+
+  it('leaves empty array when all tags are removed', () => {
+    const source = `export const meta = { tags: ['only'] };\nexport default [];\n`;
+    const out = removeTagsFromMetaInSource(source, ['only']);
+    expect(out).toContain('tags: []');
+    expect(out).not.toContain("'only'");
+  });
+
+  it('returns null on unsupported meta shape', () => {
+    const source = `export const meta = 'oops';\nexport default [];\n`;
+    expect(removeTagsFromMetaInSource(source, ['x'])).toBeNull();
+  });
+
+  it('works with braces in string values', () => {
+    const source = `export const meta = { title: '{ tricky }', tags: ['a', 'b'] };\nexport default [];\n`;
+    const out = removeTagsFromMetaInSource(source, ['a']);
+    expect(out).not.toContain("'a'");
+    expect(out).toContain("'b'");
+    expect(out).toContain("title: '{ tricky }'");
+  });
+});
+
+describe('updateMetaTitleInSource — edge cases with braces in strings/comments', () => {
+  it('handles braces inside title string value', () => {
+    const source = `export const meta = { title: '{ old }' };\nexport default [];\n`;
+    const out = updateMetaTitleInSource(source, 'new');
+    expect(out).toContain("title: 'new'");
+    expect(out).not.toContain('{ old }');
+  });
+
+  it('handles template literals with braces', () => {
+    const source = 'export const meta = { title: `{braced}` };\nexport default [];\n';
+    const out = updateMetaTitleInSource(source, 'new');
+    expect(out).toContain("title: 'new'");
+  });
+
+  it('handles comments with braces', () => {
+    const source = `export const meta = {
+  // { commented }
+  title: 'old',
+};\nexport default [];\n`;
+    const out = updateMetaTitleInSource(source, 'new');
+    expect(out).toContain("title: 'new'");
+    expect(out).toContain('// { commented }');
+  });
+
+  it('handles string values with nested braces', () => {
+    const source = `export const meta = { theme: 'light { cool }', title: 'old' };\nexport default [];\n`;
+    const out = updateMetaTitleInSource(source, 'new');
+    expect(out).toContain("title: 'new'");
+    expect(out).toContain("theme: 'light { cool }'");
   });
 });
 
