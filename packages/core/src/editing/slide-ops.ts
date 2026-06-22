@@ -5,6 +5,16 @@ import * as t from '@babel/types';
 
 export const SLIDE_ID_RE = /^[a-z0-9_-]+$/i;
 
+export const MAX_TAG_LENGTH = 200;
+
+export function validateTag(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  if (v.length === 0) return null;
+  if (v.trim().length === 0) return null;
+  if (v.length > MAX_TAG_LENGTH) return null;
+  return v;
+}
+
 type MetaTitleRead =
   | { kind: 'found'; title: string }
   | { kind: 'missing' }
@@ -71,6 +81,8 @@ type MetaPropertyInfo = {
   keyEnd: number;
   valueStart: number;
   valueEnd: number;
+  rawValueStart: number;
+  rawValueEnd: number;
 };
 
 function findMetaProperty(
@@ -88,30 +100,36 @@ function findMetaProperty(
       keyName = key.value;
     }
     if (keyName !== propertyName) continue;
+    const rawValue = unwrapExpression(prop.value as t.Expression);
     return {
       property: prop,
       keyStart: key.start as number,
       keyEnd: key.end as number,
       valueStart: prop.value.start as number,
       valueEnd: prop.value.end as number,
+      rawValueStart: rawValue ? (rawValue.start as number) : (prop.value.start as number),
+      rawValueEnd: rawValue ? (rawValue.end as number) : (prop.value.end as number),
     };
   }
   return null;
 }
 
 function readStringLiteralValue(valueNode: t.Expression): string | null {
-  if (t.isStringLiteral(valueNode)) return valueNode.value;
-  if (t.isTemplateLiteral(valueNode) && valueNode.expressions.length === 0) {
-    const first = valueNode.quasis[0];
+  const unwrapped = unwrapExpression(valueNode);
+  if (!unwrapped) return null;
+  if (t.isStringLiteral(unwrapped)) return unwrapped.value;
+  if (t.isTemplateLiteral(unwrapped) && unwrapped.expressions.length === 0) {
+    const first = unwrapped.quasis[0];
     return first.value.cooked ?? first.value.raw ?? null;
   }
   return null;
 }
 
 function readStringArrayValue(valueNode: t.Expression): string[] | null {
-  if (!t.isArrayExpression(valueNode)) return null;
+  const unwrapped = unwrapExpression(valueNode);
+  if (!unwrapped || !t.isArrayExpression(unwrapped)) return null;
   const result: string[] = [];
-  for (const el of valueNode.elements) {
+  for (const el of unwrapped.elements) {
     if (el === null) return null;
     if (t.isSpreadElement(el)) return null;
     const s = readStringLiteralValue(el as t.Expression);
@@ -257,7 +275,42 @@ export function resolveSlideEntry(slidesRoot: string, slideId: string): string |
 }
 
 function escapeSingleQuoted(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  let result = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    switch (c) {
+      case 0x5c:
+        result += '\\\\';
+        break;
+      case 0x27:
+        result += "\\'";
+        break;
+      case 0x0a:
+        result += '\\n';
+        break;
+      case 0x0d:
+        result += '\\r';
+        break;
+      case 0x09:
+        result += '\\t';
+        break;
+      case 0x0b:
+        result += '\\v';
+        break;
+      case 0x0c:
+        result += '\\f';
+        break;
+      default:
+        result += s[i];
+    }
+  }
+  return result;
+}
+
+function isSingleLineObject(metaInfo: MetaObjectInfo, source: string): boolean {
+  const { objectStart, objectEnd } = metaInfo;
+  const objectSlice = source.slice(objectStart, objectEnd);
+  return !objectSlice.includes('\n');
 }
 
 function getMetaFirstPropertyIndent(metaInfo: MetaObjectInfo, source: string): string {
@@ -275,9 +328,16 @@ function insertMetaProperty(
   metaInfo: MetaObjectInfo,
   propertyText: string,
 ): string {
-  const { objectStart } = metaInfo;
+  const { objectStart, objectNode } = metaInfo;
+  const singleLine = isSingleLineObject(metaInfo, source);
+  const hasProperties = objectNode.properties.length > 0;
+
+  if (singleLine) {
+    const insertion = hasProperties ? ` ${propertyText},` : ` ${propertyText} `;
+    return source.slice(0, objectStart + 1) + insertion + source.slice(objectStart + 1);
+  }
+
   const indent = getMetaFirstPropertyIndent(metaInfo, source);
-  const hasProperties = metaInfo.objectNode.properties.length > 0;
   const insertion = `\n${indent}${propertyText}${hasProperties ? ',' : ''}`;
   return source.slice(0, objectStart + 1) + insertion + source.slice(objectStart + 1);
 }
@@ -306,9 +366,9 @@ export function updateMetaTitleInSource(source: string, title: string): string |
     const propInfo = findMetaProperty(metaInfo, 'title');
     if (propInfo) {
       return (
-        source.slice(0, propInfo.valueStart) +
+        source.slice(0, propInfo.rawValueStart) +
         newValueText +
-        source.slice(propInfo.valueEnd)
+        source.slice(propInfo.rawValueEnd)
       );
     }
 
@@ -324,7 +384,8 @@ export function updateMetaTitleInSource(source: string, title: string): string |
 
 function serializeStringArray(items: string[]): string {
   if (items.length === 0) return '[]';
-  const parts = items.map((s) => `'${escapeSingleQuoted(s)}'`);
+  const deduped = Array.from(new Set(items));
+  const parts = deduped.map((s) => `'${escapeSingleQuoted(s)}'`);
   return `[${parts.join(', ')}]`;
 }
 
@@ -336,7 +397,8 @@ function serializeStringArray(items: string[]): string {
  * shape was too surprising to touch safely.
  */
 export function replaceMetaTagsInSource(source: string, tags: string[]): string | null {
-  const newValueText = serializeStringArray(tags);
+  const dedupedTags = Array.from(new Set(tags));
+  const newValueText = serializeStringArray(dedupedTags);
 
   const metaResult = findMetaObject(source);
   if (metaResult.kind === 'unsupported') return null;
@@ -345,9 +407,9 @@ export function replaceMetaTagsInSource(source: string, tags: string[]): string 
     const propInfo = findMetaProperty(metaInfo, 'tags');
     if (propInfo) {
       return (
-        source.slice(0, propInfo.valueStart) +
+        source.slice(0, propInfo.rawValueStart) +
         newValueText +
-        source.slice(propInfo.valueEnd)
+        source.slice(propInfo.rawValueEnd)
       );
     }
 

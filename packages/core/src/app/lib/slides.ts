@@ -1,31 +1,49 @@
 import {
-  slideCreatedAt as createdAt,
-  slideIds as ids,
-  loadSlide as load,
-  slideTags as tags,
-  slideThemes as themes,
+  slideCreatedAt,
+  slideIds,
+  loadSlide,
+  slideTags,
+  slideThemes,
 } from 'virtual:open-slide/slides';
 import type { SlideModule } from './sdk';
 
-export const slideIds: string[] = ids;
-export const slideThemes: Record<string, string> = themes;
-export const slideCreatedAt: Record<string, number> = createdAt;
-export const slideTags: Record<string, string[]> = tags;
+export { slideIds, slideThemes, slideCreatedAt, slideTags, loadSlide };
+
+export type { SlideModule };
 
 export function slidesByTheme(themeId: string): string[] {
-  return slideIds.filter((id) => slideThemes[id] === themeId);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of slideIds) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (slideThemes[id] === themeId) {
+      result.push(id);
+    }
+  }
+  return result;
 }
 
 export function slidesByTag(tag: string): string[] {
-  return slideIds.filter((id) => {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const id of slideIds) {
+    if (seen.has(id)) continue;
+    seen.add(id);
     const slideTagList = slideTags[id];
-    return slideTagList?.includes(tag);
-  });
+    if (slideTagList?.includes(tag)) {
+      result.push(id);
+    }
+  }
+  return result;
 }
 
 export function getAllTags(): string[] {
   const tagSet = new Set<string>();
+  const seenSlides = new Set<string>();
   for (const id of slideIds) {
+    if (seenSlides.has(id)) continue;
+    seenSlides.add(id);
     const tagList = slideTags[id];
     if (tagList) {
       for (const tag of tagList) {
@@ -36,13 +54,9 @@ export function getAllTags(): string[] {
   return Array.from(tagSet).sort();
 }
 
-export function slideHasTag(slideId: string, tag: string): boolean {
-  const tagList = slideTags[slideId];
+export function slideHasTag(id: string, tag: string): boolean {
+  const tagList = slideTags[id];
   return tagList?.includes(tag) ?? false;
-}
-
-export async function loadSlide(id: string): Promise<SlideModule> {
-  return load(id);
 }
 
 export function slideChangeIncludes(data: unknown, slideId: string): boolean {

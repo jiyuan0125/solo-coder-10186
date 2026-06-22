@@ -4,6 +4,7 @@ import {
   addTagsToMetaInSource,
   duplicatePageInDefaultExportInSource,
   duplicateSlideDir,
+  MAX_TAG_LENGTH,
   removePageFromDefaultExportInSource,
   removeTagsFromMetaInSource,
   reorderDefaultExportPagesInSource,
@@ -14,10 +15,37 @@ import {
   SLIDE_ID_RE,
   updateMetaTitleInSource,
   validateSlideName,
+  validateTag,
 } from '../../editing/slide-ops.ts';
 import { readManifest, writeManifest } from '../../files/folders.ts';
 import { validateMutationRequest } from '../../http/request-guard.ts';
 import { type ApiContext, json, readBody } from './context.ts';
+
+const SLIDES_VMOD = 'virtual:open-slide/slides';
+
+function resolved(id: string): string {
+  return `\0${id}`;
+}
+
+let slideChangeTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingSlideChanges = new Set<string>();
+
+function notifySlideChanged(server: ViteDevServer, id: string): void {
+  pendingSlideChanges.add(id);
+  if (slideChangeTimer) clearTimeout(slideChangeTimer);
+  slideChangeTimer = setTimeout(() => {
+    slideChangeTimer = null;
+    const mod = server.moduleGraph.getModuleById(resolved(SLIDES_VMOD));
+    if (mod) server.moduleGraph.invalidateModule(mod);
+    const slideIds = Array.from(pendingSlideChanges);
+    pendingSlideChanges.clear();
+    server.ws.send({
+      type: 'custom',
+      event: 'open-slide:slide-changed',
+      data: { slideIds },
+    });
+  }, 100);
+}
 
 // PUT    /__slides/:id/reorder            reorder pages { order: number[] }
 // DELETE /__slides/:id/pages/:i           remove page
@@ -167,11 +195,21 @@ export function registerSlideRoutes(server: ViteDevServer, ctx: ApiContext): voi
           return json(res, 400, { error: 'invalid tags — expected string array' });
         }
         const tags: string[] = [];
+        const seen = new Set<string>();
         for (const t of body.tags) {
           if (typeof t !== 'string') {
             return json(res, 400, { error: 'invalid tags — expected string array' });
           }
-          tags.push(t);
+          const validated = validateTag(t);
+          if (validated === null) {
+            return json(res, 400, {
+              error: `invalid tag — must be non-empty, non-whitespace, and ≤ ${MAX_TAG_LENGTH} characters`,
+            });
+          }
+          if (!seen.has(validated)) {
+            seen.add(validated);
+            tags.push(validated);
+          }
         }
 
         const entry = resolveSlideEntry(ctx.slidesRoot, slideId);
@@ -203,7 +241,7 @@ export function registerSlideRoutes(server: ViteDevServer, ctx: ApiContext): voi
         if (updated !== source) {
           await fs.writeFile(entry, updated, 'utf8');
         }
-        server.ws.send({ type: 'full-reload' });
+        notifySlideChanged(server, slideId);
         return json(res, 200, { ok: true, slideId, tags });
       }
 
@@ -240,10 +278,7 @@ export function registerSlideRoutes(server: ViteDevServer, ctx: ApiContext): voi
         if (updated !== source) {
           await fs.writeFile(entry, updated, 'utf8');
         }
-        // The TSX edit lands through Vite's normal HMR pipeline, but the
-        // React state holding `slide.meta` in the editor won't re-fetch on
-        // its own — tell every client to refresh so the new title shows up.
-        server.ws.send({ type: 'full-reload' });
+        notifySlideChanged(server, slideId);
         return json(res, 200, { ok: true, slideId, name });
       }
 

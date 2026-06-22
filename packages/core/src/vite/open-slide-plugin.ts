@@ -76,18 +76,21 @@ function unwrapMetaExpression(node: t.Expression | undefined): t.Expression | un
 }
 
 function readStringLiteralValue(valueNode: t.Expression): string | null {
-  if (t.isStringLiteral(valueNode)) return valueNode.value;
-  if (t.isTemplateLiteral(valueNode) && valueNode.expressions.length === 0) {
-    const first = valueNode.quasis[0];
+  const unwrapped = unwrapMetaExpression(valueNode);
+  if (!unwrapped) return null;
+  if (t.isStringLiteral(unwrapped)) return unwrapped.value;
+  if (t.isTemplateLiteral(unwrapped) && unwrapped.expressions.length === 0) {
+    const first = unwrapped.quasis[0];
     return first.value.cooked ?? first.value.raw ?? null;
   }
   return null;
 }
 
 function readStringArrayValue(valueNode: t.Expression): string[] | null {
-  if (!t.isArrayExpression(valueNode)) return null;
+  const unwrapped = unwrapMetaExpression(valueNode);
+  if (!unwrapped || !t.isArrayExpression(unwrapped)) return null;
   const result: string[] = [];
-  for (const el of valueNode.elements) {
+  for (const el of unwrapped.elements) {
     if (el === null) return null;
     if (t.isSpreadElement(el)) return null;
     const s = readStringLiteralValue(el as t.Expression);
