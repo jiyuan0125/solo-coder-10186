@@ -44,6 +44,7 @@ function notifySlideChanged(server: ViteDevServer, id: string): void {
       event: 'open-slide:slide-changed',
       data: { slideIds },
     });
+    server.ws.send({ type: 'full-reload' });
   }, 100);
 }
 
