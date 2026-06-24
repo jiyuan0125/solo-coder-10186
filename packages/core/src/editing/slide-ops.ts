@@ -9,11 +9,39 @@ type MetaTitleRead =
   | { kind: 'missing' }
   | { kind: 'unsupported' };
 
+type MetaTagsRead =
+  | { kind: 'found'; tags: string[] }
+  | { kind: 'missing' }
+  | { kind: 'unsupported' };
+
 export function validateSlideName(v: unknown): string | null {
   if (typeof v !== 'string') return null;
   const trimmed = v.trim();
   if (trimmed.length < 1 || trimmed.length > 80) return null;
   return trimmed;
+}
+
+const MAX_TAG_LENGTH = 200;
+
+export function validateTag(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  if (v.length === 0) return null;
+  if (v.trim().length === 0) return null;
+  if (v.length > MAX_TAG_LENGTH) return null;
+  return v;
+}
+
+export function normalizeTags(raw: unknown[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of raw) {
+    const tag = validateTag(item);
+    if (tag === null) continue;
+    if (seen.has(tag)) continue;
+    seen.add(tag);
+    result.push(tag);
+  }
+  return result;
 }
 
 function unwrapExpression(
@@ -29,7 +57,12 @@ function unwrapExpression(
   return current;
 }
 
-function readMetaTitleInSource(source: string): MetaTitleRead {
+function findMetaObjectExpression(
+  source: string,
+):
+  | { kind: 'ok'; objStart: number; objEnd: number; props: Array<Record<string, unknown>> }
+  | { kind: 'missing' }
+  | { kind: 'unsupported' } {
   let ast: unknown;
   try {
     ast = babelParse(source, {
@@ -52,39 +85,81 @@ function readMetaTitleInSource(source: string): MetaTitleRead {
       if (!id || id.type !== 'Identifier' || id.name !== 'meta') continue;
       const init = unwrapExpression(d.init as Record<string, unknown> | undefined);
       if (!init || init.type !== 'ObjectExpression') return { kind: 'unsupported' };
-      const properties = (init.properties as Array<Record<string, unknown>> | undefined) ?? [];
-      for (const property of properties) {
-        if (property.type !== 'ObjectProperty' || property.computed) continue;
-        const key = property.key as Record<string, unknown> | undefined;
-        const keyName =
-          key?.type === 'Identifier'
-            ? key.name
-            : key?.type === 'StringLiteral'
-              ? key.value
-              : undefined;
-        if (keyName !== 'title') continue;
-
-        const value = property.value as Record<string, unknown> | undefined;
-        if (value?.type === 'StringLiteral' && typeof value.value === 'string') {
-          return { kind: 'found', title: value.value };
-        }
-        if (value?.type === 'TemplateLiteral') {
-          const expressions = (value.expressions as unknown[] | undefined) ?? [];
-          const quasis = (value.quasis as Array<Record<string, unknown>> | undefined) ?? [];
-          const firstValue = quasis[0]?.value as Record<string, unknown> | undefined;
-          const cooked = firstValue?.cooked;
-          const raw = firstValue?.raw;
-          if (expressions.length === 0 && typeof (cooked ?? raw) === 'string') {
-            return { kind: 'found', title: (cooked ?? raw) as string };
-          }
-        }
-        return { kind: 'unsupported' };
-      }
-      return { kind: 'missing' };
+      const objStart = init.start as number;
+      const objEnd = init.end as number;
+      if (typeof objStart !== 'number' || typeof objEnd !== 'number') return { kind: 'unsupported' };
+      const props = (init.properties as Array<Record<string, unknown>> | undefined) ?? [];
+      return { kind: 'ok', objStart, objEnd, props };
     }
   }
-
   return { kind: 'missing' };
+}
+
+function findObjectProperty(
+  props: Array<Record<string, unknown>>,
+  name: string,
+): Record<string, unknown> | null {
+  for (const property of props) {
+    if (property.type !== 'ObjectProperty' || property.computed) continue;
+    const key = property.key as Record<string, unknown> | undefined;
+    const keyName =
+      key?.type === 'Identifier'
+        ? key.name
+        : key?.type === 'StringLiteral'
+          ? key.value
+          : undefined;
+    if (keyName === name) return property;
+  }
+  return null;
+}
+
+function readStringFromValue(value: Record<string, unknown> | undefined): string | null {
+  const unwrapped = unwrapExpression(value);
+  if (unwrapped?.type === 'StringLiteral' && typeof unwrapped.value === 'string') {
+    return unwrapped.value;
+  }
+  if (unwrapped?.type === 'TemplateLiteral') {
+    const expressions = (unwrapped.expressions as unknown[] | undefined) ?? [];
+    const quasis = (unwrapped.quasis as Array<Record<string, unknown>> | undefined) ?? [];
+    const firstValue = quasis[0]?.value as Record<string, unknown> | undefined;
+    const cooked = firstValue?.cooked;
+    const raw = firstValue?.raw;
+    if (expressions.length === 0 && typeof (cooked ?? raw) === 'string') {
+      return (cooked ?? raw) as string;
+    }
+  }
+  return null;
+}
+
+function readMetaTitleInSource(source: string): MetaTitleRead {
+  const found = findMetaObjectExpression(source);
+  if (found.kind === 'missing') return { kind: 'missing' };
+  if (found.kind === 'unsupported') return { kind: 'unsupported' };
+  const prop = findObjectProperty(found.props, 'title');
+  if (!prop) return { kind: 'missing' };
+  const value = prop.value as Record<string, unknown> | undefined;
+  const title = readStringFromValue(value);
+  if (title === null) return { kind: 'unsupported' };
+  return { kind: 'found', title };
+}
+
+export function readMetaTagsInSource(source: string): MetaTagsRead {
+  const found = findMetaObjectExpression(source);
+  if (found.kind === 'missing') return { kind: 'missing' };
+  if (found.kind === 'unsupported') return { kind: 'unsupported' };
+  const prop = findObjectProperty(found.props, 'tags');
+  if (!prop) return { kind: 'missing' };
+  const value = unwrapExpression(prop.value as Record<string, unknown> | undefined);
+  if (!value || value.type !== 'ArrayExpression') return { kind: 'unsupported' };
+  const elements = (value.elements as Array<Record<string, unknown> | null> | undefined) ?? [];
+  const tags: string[] = [];
+  for (const el of elements) {
+    if (el === null || el.type === 'SpreadElement') return { kind: 'unsupported' };
+    const s = readStringFromValue(el);
+    if (s === null) return { kind: 'unsupported' };
+    tags.push(s);
+  }
+  return { kind: 'found', tags };
 }
 
 export async function rmSlideDir(slidesRoot: string, slideId: string): Promise<boolean> {
@@ -188,70 +263,172 @@ export function resolveSlideEntry(slidesRoot: string, slideId: string): string |
 }
 
 function escapeSingleQuoted(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    switch (c) {
+      case 0x5c:
+        out += '\\\\';
+        break;
+      case 0x27:
+        out += "\\'";
+        break;
+      case 0x0a:
+        out += '\\n';
+        break;
+      case 0x0d:
+        out += '\\r';
+        break;
+      case 0x09:
+        out += '\\t';
+        break;
+      case 0x0b:
+        out += '\\v';
+        break;
+      case 0x08:
+        out += '\\b';
+        break;
+      case 0x0c:
+        out += '\\f';
+        break;
+      default:
+        out += s[i];
+    }
+  }
+  return out;
+}
+
+function formatSingleQuoted(s: string): string {
+  return `'${escapeSingleQuoted(s)}'`;
+}
+
+function getStringLiteralRange(
+  valueNode: Record<string, unknown>,
+): { start: number; end: number } | null {
+  let current: Record<string, unknown> | undefined = valueNode;
+  while (
+    current &&
+    (current.type === 'TSAsExpression' || current.type === 'TSSatisfiesExpression')
+  ) {
+    current = current.expression as Record<string, unknown> | undefined;
+  }
+  if (!current) return null;
+  if (current.type === 'StringLiteral' || current.type === 'TemplateLiteral') {
+    const start = current.start as number | undefined;
+    const end = current.end as number | undefined;
+    if (typeof start !== 'number' || typeof end !== 'number') return null;
+    return { start, end };
+  }
+  return null;
+}
+
+function findPropertyValueNode(
+  prop: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  return prop.value as Record<string, unknown> | undefined;
+}
+
+type PropertyInsertionStyle = {
+  prefix: string;
+  suffix: string;
+  separator: string;
+};
+
+function getPropertyInsertionStyle(
+  source: string,
+  objStart: number,
+  objEnd: number,
+  props: Array<Record<string, unknown>>,
+): PropertyInsertionStyle {
+  const body = source.slice(objStart + 1, objEnd);
+  const isSingleLine = !body.includes('\n');
+
+  if (isSingleLine) {
+    const hasProps = props.length > 0;
+    return {
+      prefix: '',
+      suffix: hasProps ? ' ' : '',
+      separator: hasProps ? ', ' : '',
+    };
+  }
+
+  const firstIndentMatch = body.match(/\n([ \t]+)\S/);
+  const indent = firstIndentMatch ? firstIndentMatch[1] : '  ';
+  const hasProps = props.length > 0;
+  return {
+    prefix: `\n${indent}`,
+    suffix: hasProps ? ',' : '',
+    separator: '',
+  };
+}
+
+function setMetaProperty(
+  source: string,
+  propName: 'title' | 'tags',
+  newValueText: string,
+): string | null {
+  const found = findMetaObjectExpression(source);
+  if (found.kind === 'unsupported') return null;
+
+  if (found.kind === 'missing') {
+    const exportDefaultIdx = source.search(/export\s+default\b/);
+    if (exportDefaultIdx === -1) return null;
+    const insertion = `export const meta: SlideMeta = { ${propName}: ${newValueText} };\n\n`;
+    return source.slice(0, exportDefaultIdx) + insertion + source.slice(exportDefaultIdx);
+  }
+
+  const { objStart, objEnd, props } = found;
+  const existingProp = findObjectProperty(props, propName);
+
+  if (existingProp) {
+    if (propName === 'title') {
+      const valueNode = findPropertyValueNode(existingProp);
+      const range = valueNode ? getStringLiteralRange(valueNode) : null;
+      if (!range) return null;
+      return source.slice(0, range.start) + newValueText + source.slice(range.end);
+    }
+    if (propName === 'tags') {
+      const valueNode = unwrapExpression(findPropertyValueNode(existingProp));
+      if (!valueNode) return null;
+      const start = valueNode.start as number | undefined;
+      const end = valueNode.end as number | undefined;
+      if (typeof start !== 'number' || typeof end !== 'number') return null;
+      return source.slice(0, start) + newValueText + source.slice(end);
+    }
+  }
+
+  const style = getPropertyInsertionStyle(source, objStart, objEnd, props);
+  let closeBrace = objEnd - 1;
+  while (closeBrace > objStart && source[closeBrace] !== '}') closeBrace--;
+  let beforeClose = closeBrace;
+  while (beforeClose > objStart && /\s/.test(source[beforeClose - 1])) beforeClose--;
+  const insertion = `${style.separator}${style.prefix}${propName}: ${newValueText}${style.suffix}`;
+  return source.slice(0, beforeClose) + insertion + source.slice(closeBrace);
 }
 
 /**
  * Rewrite (or insert) the `title` field in the slide module's `export const meta`.
  *
- * Strategy:
- *   1. Find `export const meta` and brace-match its object literal.
- *   2. If the object already has a `title: '...'` entry, replace the literal.
- *   3. If the object exists but has no title, inject a new `title: '...'` line
- *      as the first property (preserving the author's surrounding indentation).
- *   4. If there is no `meta` export at all, insert a fresh one right before
- *      `export default`.
+ * Uses AST to correctly handle type assertions like `as const` wrapping the value,
+ * and preserves the object's layout (single-line vs. multi-line with existing indentation).
  *
  * Returns the rewritten source, or `null` if the file shape was too surprising
  * to touch safely (e.g. `export default` missing when we'd need to inject meta).
  */
 export function updateMetaTitleInSource(source: string, title: string): string | null {
-  const newLiteral = `'${escapeSingleQuoted(title)}'`;
+  return setMetaProperty(source, 'title', formatSingleQuoted(title));
+}
 
-  const metaStart = source.search(/export\s+const\s+meta\b/);
-  if (metaStart !== -1) {
-    const eqIdx = source.indexOf('=', metaStart);
-    if (eqIdx === -1) return null;
-    const openBrace = source.indexOf('{', eqIdx);
-    if (openBrace === -1) return null;
-
-    let depth = 0;
-    let closeBrace = -1;
-    for (let i = openBrace; i < source.length; i++) {
-      const ch = source[i];
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) {
-          closeBrace = i;
-          break;
-        }
-      }
-    }
-    if (closeBrace === -1) return null;
-
-    const body = source.slice(openBrace + 1, closeBrace);
-    const titleRe = /(^|[\s,{])(title\s*:\s*)(['"`])((?:\\.|(?!\3).)*)\3/;
-    const match = body.match(titleRe);
-    if (match) {
-      const newBody = body.replace(titleRe, `${match[1]}${match[2]}${newLiteral}`);
-      return source.slice(0, openBrace + 1) + newBody + source.slice(closeBrace);
-    }
-
-    // No title yet — inject as the first property, copying the indentation of
-    // the first existing property (or a sensible default for an empty object).
-    const firstIndentMatch = body.match(/\n([ \t]+)\S/);
-    const indent = firstIndentMatch ? firstIndentMatch[1] : '  ';
-    const trimmedBody = body.replace(/^\s*\n?/, '');
-    const needsSeparator = trimmedBody.trim().length > 0;
-    const insertion = `\n${indent}title: ${newLiteral}${needsSeparator ? ',' : ''}`;
-    return source.slice(0, openBrace + 1) + insertion + body + source.slice(closeBrace);
-  }
-
-  const exportDefaultIdx = source.search(/export\s+default\b/);
-  if (exportDefaultIdx === -1) return null;
-  const insertion = `export const meta: SlideMeta = { title: ${newLiteral} };\n\n`;
-  return source.slice(0, exportDefaultIdx) + insertion + source.slice(exportDefaultIdx);
+/**
+ * Rewrite (or insert) the `tags` field in the slide module's `export const meta`.
+ *
+ * Uses AST to correctly handle type assertions and preserves object layout.
+ * Tags are written as single-quoted string literals in an array literal.
+ */
+export function updateMetaTagsInSource(source: string, tags: string[]): string | null {
+  const formatted = tags.map((t) => formatSingleQuoted(t)).join(', ');
+  const newArrayText = `[${formatted}]`;
+  return setMetaProperty(source, 'tags', newArrayText);
 }
 
 type ArrayElementRange = { start: number; end: number };

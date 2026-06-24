@@ -3,7 +3,11 @@ declare module 'virtual:open-slide/slides' {
   export const slideIds: string[];
   export const slideThemes: Record<string, string>;
   export const slideCreatedAt: Record<string, number>;
+  export const slideTags: Record<string, string[]>;
   export function loadSlide(id: string): Promise<SlideModule>;
+  export function slidesByTag(tag: string): string[];
+  export function listAllTags(): string[];
+  export function slideHasTag(slideId: string, tag: string): boolean;
 }
 
 declare module 'virtual:open-slide/config' {

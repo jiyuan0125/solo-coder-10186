@@ -5,11 +5,15 @@ import { describe, expect, it } from 'vitest';
 import {
   duplicatePageInDefaultExportInSource,
   duplicateSlideDir,
+  normalizeTags,
+  readMetaTagsInSource,
   removePageFromDefaultExportInSource,
   reorderDefaultExportPagesInSource,
   reorderNotesArrayInSource,
+  updateMetaTagsInSource,
   updateMetaTitleInSource,
   validateSlideName,
+  validateTag,
 } from './slide-ops.ts';
 
 async function withSlidesRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
@@ -410,5 +414,317 @@ export default [
 
   it('returns null when the default export is not an array', () => {
     expect(duplicatePageInDefaultExportInSource(`export default A;\n`, 0)).toBeNull();
+  });
+});
+
+describe('validateTag', () => {
+  it('accepts normal tags', () => {
+    expect(validateTag('intro')).toBe('intro');
+    expect(validateTag('chapter-1')).toBe('chapter-1');
+    expect(validateTag('中文标签')).toBe('中文标签');
+  });
+
+  it('rejects empty string', () => {
+    expect(validateTag('')).toBeNull();
+  });
+
+  it('rejects pure whitespace', () => {
+    expect(validateTag('   ')).toBeNull();
+    expect(validateTag('\t\n')).toBeNull();
+  });
+
+  it('rejects overly long tags', () => {
+    expect(validateTag('x'.repeat(200))).toBe('x'.repeat(200));
+    expect(validateTag('x'.repeat(201))).toBeNull();
+  });
+
+  it('rejects non-string input', () => {
+    expect(validateTag(null)).toBeNull();
+    expect(validateTag(undefined)).toBeNull();
+    expect(validateTag(123)).toBeNull();
+    expect(validateTag({})).toBeNull();
+  });
+
+  it('preserves special characters in valid tags', () => {
+    expect(validateTag('a\nb')).toBe('a\nb');
+    expect(validateTag('tab\there')).toBe('tab\there');
+    expect(validateTag('emoji-🎉')).toBe('emoji-🎉');
+  });
+});
+
+describe('normalizeTags', () => {
+  it('deduplicates tags', () => {
+    expect(normalizeTags(['a', 'b', 'a', 'c', 'b'])).toEqual(['a', 'b', 'c']);
+  });
+
+  it('filters invalid tags', () => {
+    expect(normalizeTags(['ok', '', '   ', null as unknown as string, 123 as unknown as string])).toEqual(['ok']);
+  });
+
+  it('handles empty input', () => {
+    expect(normalizeTags([])).toEqual([]);
+  });
+});
+
+describe('readMetaTagsInSource', () => {
+  it('reads tags from a simple meta object', () => {
+    const src = `export const meta = { title: 't', tags: ['a', 'b'] };\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'found', tags: ['a', 'b'] });
+  });
+
+  it('returns missing when tags field absent', () => {
+    const src = `export const meta = { title: 't' };\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'missing' });
+  });
+
+  it('returns missing when meta export absent', () => {
+    expect(readMetaTagsInSource(`export default [];\n`)).toEqual({ kind: 'missing' });
+  });
+
+  it('handles `as const` wrapping the entire meta object', () => {
+    const src = `export const meta = { title: 't', tags: ['a'] } as const;\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'found', tags: ['a'] });
+  });
+
+  it('handles `as const` wrapping individual tag strings', () => {
+    const src = `export const meta = { tags: ['a' as const, 'b' as const] };\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'found', tags: ['a', 'b'] });
+  });
+
+  it('handles satisfies wrapping the meta object', () => {
+    const src = `export const meta = { tags: ['x'] } satisfies SlideMeta;\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'found', tags: ['x'] });
+  });
+
+  it('reads tags with special characters', () => {
+    const src = `export const meta = { tags: ['line\\nbreak', 'tab\\there', '🎉'] };\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'found', tags: ['line\nbreak', 'tab\there', '🎉'] });
+  });
+
+  it('reads double-quoted and template tags', () => {
+    const src = 'export const meta = { tags: ["a", `b`] };\nexport default [];\n';
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'found', tags: ['a', 'b'] });
+  });
+
+  it('returns unsupported when tags value is not an array', () => {
+    const src = `export const meta = { tags: 'not-array' };\nexport default [];\n`;
+    expect(readMetaTagsInSource(src)).toEqual({ kind: 'unsupported' });
+  });
+});
+
+describe('updateMetaTitleInSource — type assertions', () => {
+  it('replaces title when value is wrapped in `as const`', () => {
+    const src = `export const meta = { title: 'old' as const };\nexport default [];\n`;
+    const out = updateMetaTitleInSource(src, 'new');
+    expect(out).not.toBeNull();
+    expect(out).toContain("title: 'new'");
+    expect(out).not.toContain("'old'");
+  });
+
+  it('replaces title when whole meta is wrapped in `as const`', () => {
+    const src = `export const meta = { title: 'old' } as const;\nexport default [];\n`;
+    const out = updateMetaTitleInSource(src, 'new');
+    expect(out).not.toBeNull();
+    expect(out).toContain("title: 'new'");
+    expect(out).toContain('as const');
+  });
+});
+
+describe('updateMetaTagsInSource', () => {
+  it('replaces an existing tags array on a single line', () => {
+    const src = `export const meta = { title: 't', tags: ['old'] };\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, ['a', 'b']);
+    expect(out).not.toBeNull();
+    expect(out).toContain("tags: ['a', 'b']");
+    expect(out).not.toContain("'old'");
+    expect(out).toContain("{ title: 't', tags: ['a', 'b'] }");
+  });
+
+  it('replaces tags when wrapped in `as const`', () => {
+    const src = `export const meta = { tags: ['old'] as const };\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, ['new']);
+    expect(out).not.toBeNull();
+    expect(out).toContain("tags: ['new']");
+    expect(out).toContain('as const');
+  });
+
+  it('preserves multi-line indentation when replacing existing tags', () => {
+    const src = `export const meta = {\n  title: 't',\n  tags: ['old'],\n};\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, ['a', 'b']);
+    expect(out).not.toBeNull();
+    expect(out).toContain('  title');
+    expect(out).toContain("tags: ['a', 'b']");
+    expect(out).toMatch(/\n  tags: \['a', 'b'\],/);
+  });
+
+  it('injects tags into a single-line meta object without breaking compact layout', () => {
+    const src = `export const meta = { title: 't' };\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, ['x']);
+    expect(out).not.toBeNull();
+    expect(out).toContain("{ title: 't', tags: ['x'] }");
+    expect(out).not.toContain('\ntags');
+  });
+
+  it('injects tags into a multi-line meta object preserving indentation', () => {
+    const src = `export const meta = {\n  title: 't',\n};\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, ['x']);
+    expect(out).not.toBeNull();
+    expect(out).toMatch(/\n  tags: \['x'\],/);
+    expect(out).toContain('  title');
+  });
+
+  it('injects fresh meta + tags when no meta export exists', () => {
+    const src = `export default [];\n`;
+    const out = updateMetaTagsInSource(src, ['a']);
+    expect(out).not.toBeNull();
+    expect(out).toContain("export const meta: SlideMeta = { tags: ['a'] };");
+    expect(out).toContain('export default []');
+  });
+
+  it('escapes special characters in tag strings', () => {
+    const src = `export const meta = { tags: [] };\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, ["it's", 'a\\b', 'line\nbreak']);
+    expect(out).not.toBeNull();
+    expect(out).toContain("'it\\'s'");
+    expect(out).toContain("'a\\\\b'");
+    expect(out).toContain("'line\\nbreak'");
+  });
+
+  it('writes an empty tags array', () => {
+    const src = `export const meta = { title: 't' };\nexport default [];\n`;
+    const out = updateMetaTagsInSource(src, []);
+    expect(out).not.toBeNull();
+    expect(out).toContain('tags: []');
+  });
+});
+
+describe('tags helpers', () => {
+  function buildHelpers(ids: string[], tagsMap: Record<string, string[]>) {
+    return {
+      slidesByTag: (tag: string) => ids.filter((id) => (tagsMap[id] ?? []).indexOf(tag) !== -1),
+      listAllTags: () => {
+        const seen = new Set<string>();
+        const result: string[] = [];
+        for (const id of ids) {
+          for (const t of tagsMap[id] ?? []) {
+            if (!seen.has(t)) {
+              seen.add(t);
+              result.push(t);
+            }
+          }
+        }
+        return result;
+      },
+      slideHasTag: (slideId: string, tag: string) =>
+        (tagsMap[slideId] ?? []).indexOf(tag) !== -1,
+    };
+  }
+
+  it('slidesByTag returns empty array for nonexistent tag', () => {
+    const h = buildHelpers(['s1', 's2'], { s1: ['intro'] });
+    expect(h.slidesByTag('missing')).toEqual([]);
+  });
+
+  it('slidesByTag finds slides with multiple tags', () => {
+    const h = buildHelpers(
+      ['s1', 's2', 's3'],
+      { s1: ['intro', 'ch1'], s2: ['ch1'], s3: ['outro'] },
+    );
+    expect(h.slidesByTag('ch1')).toEqual(['s1', 's2']);
+    expect(h.slidesByTag('intro')).toEqual(['s1']);
+  });
+
+  it('listAllTags returns empty on empty tagsMap', () => {
+    const h = buildHelpers(['s1', 's2'], {});
+    expect(h.listAllTags()).toEqual([]);
+  });
+
+  it('listAllTags deduplicates across slides', () => {
+    const h = buildHelpers(['s1', 's2'], { s1: ['a', 'b'], s2: ['b', 'c'] });
+    expect(h.listAllTags()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('slideHasTag returns false for missing slide or tag', () => {
+    const h = buildHelpers(['s1'], { s1: ['a'] });
+    expect(h.slideHasTag('missing', 'a')).toBe(false);
+    expect(h.slideHasTag('s1', 'missing')).toBe(false);
+  });
+
+  it('slideHasTag returns true when slide carries tag', () => {
+    const h = buildHelpers(['s1'], { s1: ['a', 'b'] });
+    expect(h.slideHasTag('s1', 'a')).toBe(true);
+    expect(h.slideHasTag('s1', 'b')).toBe(true);
+  });
+
+  it('duplicate slide ids counted once', () => {
+    const h = buildHelpers(
+      ['s1', 's1', 's2'],
+      { s1: ['a'], s2: ['b'] },
+    );
+    expect(h.slidesByTag('a')).toEqual(['s1', 's1']);
+    expect(h.listAllTags()).toEqual(['a', 'b']);
+  });
+});
+
+describe('duplicateSlideDir preserves tags', () => {
+  it('copies tags verbatim from source to copy', async () => {
+    await withSlidesRoot(async (root) => {
+      await fs.mkdir(path.join(root, 'tagged', 'assets'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, 'tagged', 'index.tsx'),
+        `export const meta = { title: 'T', tags: ['a', 'b'] };\nexport default [];\n`,
+        'utf8',
+      );
+
+      const result = await duplicateSlideDir(root, 'tagged');
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const copied = await fs.readFile(
+        path.join(root, result.slideId, 'index.tsx'),
+        'utf8',
+      );
+      expect(copied).toContain("tags: ['a', 'b']");
+      expect(copied).toContain("title: 'T (copy)'");
+    });
+  });
+
+  it('creates a copy without tags field when source has none', async () => {
+    await withSlidesRoot(async (root) => {
+      await fs.mkdir(path.join(root, 'notags', 'assets'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, 'notags', 'index.tsx'),
+        `export const meta = { title: 'T' };\nexport default [];\n`,
+        'utf8',
+      );
+
+      const result = await duplicateSlideDir(root, 'notags');
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const copied = await fs.readFile(
+        path.join(root, result.slideId, 'index.tsx'),
+        'utf8',
+      );
+      expect(copied).not.toContain('tags');
+    });
+  });
+
+  it('copies an empty tags array verbatim', async () => {
+    await withSlidesRoot(async (root) => {
+      await fs.mkdir(path.join(root, 'empty-tags', 'assets'), { recursive: true });
+      await fs.writeFile(
+        path.join(root, 'empty-tags', 'index.tsx'),
+        `export const meta = { title: 'T', tags: [] };\nexport default [];\n`,
+        'utf8',
+      );
+
+      const result = await duplicateSlideDir(root, 'empty-tags');
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const copied = await fs.readFile(
+        path.join(root, result.slideId, 'index.tsx'),
+        'utf8',
+      );
+      expect(copied).toContain('tags: []');
+    });
   });
 });
