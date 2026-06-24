@@ -1,0 +1,17 @@
+{
+  "title": "open-slide",
+  "pages": [
+    "index",
+    "getting-started",
+    "---Flow---",
+    "...flow",
+    "---Core feature---",
+    "...core-feature",
+    "---Skills---",
+    "...skills",
+    "---CLI---",
+    "...cli",
+    "---Reference---",
+    "...reference"
+  ]
+}
